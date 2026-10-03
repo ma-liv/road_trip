@@ -41,6 +41,9 @@
   .pop { animation: pop .35s cubic-bezier(.3,1.5,.5,1) both; }
   @keyframes captionIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
   .caption-in { animation: captionIn .5s ease both; }
+  @keyframes confetti { 0% { transform: translate(0, 0) rotate(0); opacity: 1; } 100% { transform: translate(var(--x), var(--y)) rotate(var(--r)); opacity: 0; } }
+  @keyframes spinSlow { to { transform: rotate(360deg); } }
+  .spin-slow { animation: spinSlow 10s linear infinite; }
   .press { transition: transform .12s ease; }
   .press:active { transform: scale(.96); }
   @media (prefers-reduced-motion: reduce) {
@@ -135,7 +138,7 @@ function PlaneIcon({ size = 16, color = "#FFFFFF", rotate = 90, style = {} }) {
 
 /* ---------- Géocodage (OpenStreetMap / Nominatim, mis en cache sur l'appareil) ---------- */
 
-const GEO_LS = "rt-geo-v1";
+const GEO_LS = "rt-geo-v2";
 const geoCache = (() => { try { return JSON.parse(localStorage.getItem(GEO_LS) || "{}"); } catch (e) { return {}; } })();
 const geoPending = {};
 let geoChain = Promise.resolve();
@@ -147,10 +150,11 @@ function geocode(q) {
   if (geoPending[k]) return geoPending[k];
   // Une requête à la fois, espacées d'1 s (règle d'usage de Nominatim)
   geoPending[k] = geoChain = geoChain.then(() =>
-    fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=fr&q=${encodeURIComponent(q)}`)
+    fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&addressdetails=1&accept-language=fr&q=${encodeURIComponent(q)}`)
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((j) => {
-        geoCache[k] = j && j[0] ? { lat: +j[0].lat, lon: +j[0].lon } : null;
+        const a = (j && j[0] && j[0].address) || {};
+        geoCache[k] = j && j[0] ? { lat: +j[0].lat, lon: +j[0].lon, cc: (a.country_code || "").toUpperCase(), country: a.country || "" } : null;
         try { localStorage.setItem(GEO_LS, JSON.stringify(geoCache)); } catch (e) {}
         return geoCache[k];
       })
@@ -195,6 +199,7 @@ function loadWorld() {
       .then((topo) => ({
         land: topojson.feature(topo, topo.objects.land),
         borders: topojson.mesh(topo, topo.objects.countries, (a, b) => a !== b),
+        countries: topojson.feature(topo, topo.objects.countries).features,
       }))
       .catch(() => null);
   }
@@ -542,6 +547,84 @@ function AuthScreen() {
   );
 }
 
+/* ---------- Données dérivées : lieux, pays, continents ---------- */
+
+const CONTINENTS = {
+  "Europe": "AD AL AT AX BA BE BG BY CH CY CZ DE DK EE ES FI FO FR GB GG GI GR HR HU IE IM IS IT JE LI LT LU LV MC MD ME MK MT NL NO PL PT RO RS RU SE SI SJ SK SM UA VA XK",
+  "Asie": "AE AF AM AZ BD BH BN BT CN GE HK ID IL IN IQ IR JO JP KG KH KP KR KW KZ LA LB LK MM MN MO MV MY NP OM PH PK PS QA SA SG SY TH TJ TL TM TR TW UZ VN YE",
+  "Afrique": "AO BF BI BJ BW CD CF CG CI CM CV DJ DZ EG EH ER ET GA GH GM GN GQ GW KE KM LR LS LY MA MG ML MR MU MW MZ NA NE NG RE RW SC SD SH SL SN SO SS ST SZ TD TG TN TZ UG YT ZA ZM ZW",
+  "Amérique du Nord": "AG AI AW BB BL BM BQ BS BZ CA CR CU CW DM DO GD GL GP GT HN HT JM KN KY LC MF MQ MS MX NI PA PM PR SV SX TC TT US VC VG VI",
+  "Amérique du Sud": "AR BO BR CL CO EC FK GF GY PE PY SR UY VE",
+  "Océanie": "AS AU CK FJ FM GU KI MH MP NC NF NR NU NZ PF PG PN PW SB TK TO TV UM VU WF WS",
+};
+const CC_CONTINENT = {};
+Object.entries(CONTINENTS).forEach(([k, v]) => v.split(" ").forEach((c) => (CC_CONTINENT[c] = k)));
+const CONTINENT_EMOJI = { "Europe": "🏰", "Asie": "🏯", "Afrique": "🦒", "Amérique du Nord": "🗽", "Amérique du Sud": "🦜", "Océanie": "🐨" };
+const WORLD_COUNTRIES = 195;
+
+const STATUS = {
+  visite: { label: "Visité", color: SAGE, rank: 4 },
+  en_cours: { label: "En cours", color: GOLD, rank: 3 },
+  prevu: { label: "Prévu", color: ROSE, rank: 2 },
+  reve: { label: "Rêvé", color: "#9868A8", rank: 1 },
+};
+function tripPlaceStatus(t) {
+  const l = tripStatus(t).label;
+  return l === "Terminé" ? "visite" : l === "En cours" ? "en_cours" : "prevu";
+}
+// Tous les lieux de l'app, le statut le plus "fort" en premier (visité > en cours > prévu > rêvé)
+function allPlaces(bucket, trips, journal) {
+  const out = [];
+  bucket.forEach((i) => out.push({ q: [i.place, i.country].filter(Boolean).join(", "), label: i.place, sub: i.country, status: i.status === "visite" ? "visite" : "reve" }));
+  trips.forEach((t) => {
+    const st = tripPlaceStatus(t);
+    const stops = t.stops || [];
+    (stops.length ? stops.map((s) => s.name) : parseCountries(t.countries)).forEach((n) => out.push({ q: n, label: n, sub: t.title, status: st }));
+  });
+  journal.forEach((j) => { if (j.place || j.country) out.push({ q: [j.place, j.country].filter(Boolean).join(", "), label: j.place || j.country, sub: j.country, status: "visite" }); });
+  return out.filter((i) => i.q).map((i) => ({ ...i, done: i.status === "visite" })).sort((a, b) => STATUS[b.status].rank - STATUS[a.status].rank);
+}
+const geoOf = (q) => (q ? geoCache[geoKey(q)] : null);
+function distKm(a, b) { return Math.round(d3.geoDistance([a.lon, a.lat], [b.lon, b.lat]) * 6371); }
+function tripKm(trip) {
+  let total = 0;
+  const stops = trip.stops || [];
+  for (let i = 1; i < stops.length; i++) {
+    const a = geoOf(stops[i - 1].name), b = geoOf(stops[i].name);
+    if (a && b) total += distKm(a, b);
+  }
+  return total;
+}
+const eur = (n) => new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR", maximumFractionDigits: 0 }).format(n || 0);
+const fmtNum = (n) => new Intl.NumberFormat("fr-FR").format(n || 0);
+function relTime(d) {
+  const n = daysBetween(d, todayISO());
+  if (n < 1) return "aujourd'hui";
+  if (n < 31) return `il y a ${n} jour${n > 1 ? "s" : ""}`;
+  if (n < 365) return `il y a ${Math.round(n / 30.4)} mois`;
+  const y = Math.round(n / 365);
+  return `il y a ${y} an${y > 1 ? "s" : ""}`;
+}
+function shuffle(arr) { const a = [...arr]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function dbError(msg) {
+  return /column|schema cache/i.test(msg || "") ? `${msg} — Lance le fichier supabase-update-v2.sql dans Supabase (SQL Editor), puis réessaie.` : msg;
+}
+function useCountUp(value, dur = 1000) {
+  const [v, setV] = useState(0);
+  useEffect(() => {
+    let raf, start;
+    const step = (now) => {
+      if (!start) start = now;
+      const k = Math.min(1, (now - start) / dur);
+      setV(Math.round(value * (1 - Math.pow(1 - k, 3))));
+      if (k < 1) raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [value]);
+  return v;
+}
+
 /* ---------- App principale ---------- */
 
 function App({ session }) {
@@ -554,7 +637,9 @@ function App({ session }) {
   const [bucketEditor, setBucketEditor] = useState(null);
   const [tripEditor, setTripEditor] = useState(null);
   const [journalEditor, setJournalEditor] = useState(null);
+  const [wheelOpen, setWheelOpen] = useState(false);
   const [error, setError] = useState("");
+  const fail = (err) => { if (err) setError(dbError(err.message)); };
 
   const fetchAll = async () => {
     const [b, t, j] = await Promise.all([
@@ -576,14 +661,15 @@ function App({ session }) {
     const { error } = item.id
       ? await sb.from("bucket_list").update(item).eq("id", item.id)
       : await sb.from("bucket_list").insert({ ...item, user_id: session.user.id });
-    if (error) setError(error.message);
+    fail(error);
     setBucketEditor(null); fetchAll();
   };
-  const deleteBucket = async (id) => { const { error } = await sb.from("bucket_list").delete().eq("id", id); if (error) setError(error.message); fetchAll(); };
+  const deleteBucket = async (id) => { const { error } = await sb.from("bucket_list").delete().eq("id", id); fail(error); fetchAll(); };
   const toggleBucketStatus = async (item) => {
     const status = item.status === "visite" ? "a_visiter" : "visite";
+    setBucket((bs) => bs.map((b) => (b.id === item.id ? { ...b, status } : b)));
     const { error } = await sb.from("bucket_list").update({ status }).eq("id", item.id);
-    if (error) setError(error.message); fetchAll();
+    fail(error); fetchAll();
   };
 
   // ---- trips ----
@@ -593,13 +679,16 @@ function App({ session }) {
     const { error } = trip.id
       ? await sb.from("trips").update(payload).eq("id", trip.id)
       : await sb.from("trips").insert({ ...payload, user_id: session.user.id, stops: [] });
-    if (error) setError(error.message);
+    fail(error);
     setTripEditor(null); fetchAll();
   };
-  const deleteTrip = async (id) => { const { error } = await sb.from("trips").delete().eq("id", id); if (error) setError(error.message); setOpenTripId(null); fetchAll(); };
-  const saveStops = async (tripId, stops) => {
-    const { error } = await sb.from("trips").update({ stops, updated_at: new Date().toISOString() }).eq("id", tripId);
-    if (error) setError(error.message); fetchAll();
+  const deleteTrip = async (id) => { const { error } = await sb.from("trips").delete().eq("id", id); fail(error); setOpenTripId(null); fetchAll(); };
+  // Mise à jour partielle d'un voyage (étapes, checklist, dépenses) — affichée tout de suite
+  const patchTrip = async (tripId, fields) => {
+    setError("");
+    setTrips((ts) => ts.map((t) => (t.id === tripId ? { ...t, ...fields } : t)));
+    const { error } = await sb.from("trips").update({ ...fields, updated_at: new Date().toISOString() }).eq("id", tripId);
+    fail(error); fetchAll();
   };
 
   // ---- journal ----
@@ -608,12 +697,18 @@ function App({ session }) {
     const { error } = entry.id
       ? await sb.from("journal_entries").update(entry).eq("id", entry.id)
       : await sb.from("journal_entries").insert({ ...entry, user_id: session.user.id });
-    if (error) setError(error.message);
+    fail(error);
     setJournalEditor(null); fetchAll();
   };
-  const deleteJournal = async (id) => { const { error } = await sb.from("journal_entries").delete().eq("id", id); if (error) setError(error.message); fetchAll(); };
+  const deleteJournal = async (id) => { const { error } = await sb.from("journal_entries").delete().eq("id", id); fail(error); fetchAll(); };
 
   const openTrip = trips.find((t) => t.id === openTripId) || null;
+  const errorBanner = error && (
+    <div className="mx-5 mt-4 text-xs px-3 py-2 rounded flex items-start gap-2" style={{ backgroundColor: DANGER + "1A", border: `1px solid ${DANGER}`, color: TEXT }}>
+      <span className="flex-1">{error}</span>
+      <button onClick={() => setError("")} style={{ color: TEXT_MUTED }}>✕</button>
+    </div>
+  );
 
   if (!ready) return <Boarding text="Embarquement…" />;
 
@@ -622,8 +717,9 @@ function App({ session }) {
       <TripDetail
         trip={openTrip}
         journal={journal.filter((j) => j.trip_id === openTrip.id)}
+        errorBanner={errorBanner}
         onBack={() => setOpenTripId(null)}
-        onSaveStops={(stops) => saveStops(openTrip.id, stops)}
+        onPatch={(fields) => patchTrip(openTrip.id, fields)}
         onEditTrip={() => setTripEditor(openTrip)}
         onDeleteTrip={() => deleteTrip(openTrip.id)}
         onAddJournal={() => setJournalEditor({ trip_id: openTrip.id })}
@@ -638,16 +734,17 @@ function App({ session }) {
     <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", backgroundColor: BG, color: TEXT, minHeight: "100vh", paddingBottom: "calc(104px + env(safe-area-inset-bottom))" }}>
       <MainHero tab={tab} bucket={bucket} trips={trips} journal={journal} onLogout={logout} onOpenTrip={(t) => setOpenTripId(t.id)} />
 
-      {error && <div className="mx-5 mt-4 text-xs px-3 py-2 rounded" style={{ backgroundColor: DANGER + "1A", border: `1px solid ${DANGER}`, color: TEXT }}>{error}</div>}
+      {errorBanner}
 
       <main key={tab} className="px-5 mt-6">
         {tab === "bucket" && (
-          <BucketList items={bucket} onAdd={() => setBucketEditor(true)} onEdit={(i) => setBucketEditor(i)} onDelete={deleteBucket} onToggle={toggleBucketStatus} />
+          <BucketList items={bucket} onAdd={() => setBucketEditor(true)} onEdit={(i) => setBucketEditor(i)} onDelete={deleteBucket} onToggle={toggleBucketStatus} onWheel={() => setWheelOpen(true)} />
         )}
         {tab === "trips" && <Trips trips={trips} onAdd={() => setTripEditor(true)} onOpen={(t) => setOpenTripId(t.id)} />}
         {tab === "journal" && (
           <Journal entries={journal} trips={trips} onAdd={() => setJournalEditor(true)} onEdit={(e) => setJournalEditor(e)} onDelete={deleteJournal} />
         )}
+        {tab === "world" && <MyWorld bucket={bucket} trips={trips} journal={journal} />}
       </main>
 
       <nav className="flex p-1.5 rounded-2xl"
@@ -655,11 +752,13 @@ function App({ session }) {
         <TabButton active={tab === "bucket"} onClick={() => setTab("bucket")} icon="globe" label="Bucket list" />
         <TabButton active={tab === "trips"} onClick={() => setTab("trips")} icon="plane" label="Road trips" />
         <TabButton active={tab === "journal"} onClick={() => setTab("journal")} icon="book" label="Carnet" />
+        <TabButton active={tab === "world"} onClick={() => setTab("world")} icon="map" label="Mon monde" />
       </nav>
 
       {bucketEditor && <BucketForm initial={typeof bucketEditor === "object" ? bucketEditor : null} onClose={() => setBucketEditor(null)} onSubmit={saveBucket} />}
       {tripEditor && <TripForm initial={typeof tripEditor === "object" ? tripEditor : null} onClose={() => setTripEditor(null)} onSubmit={saveTrip} />}
       {journalEditor && <JournalForm initial={typeof journalEditor === "object" ? journalEditor : null} trips={trips} onClose={() => setJournalEditor(null)} onSubmit={saveJournal} />}
+      {wheelOpen && <DestinationWheel items={bucket} onClose={() => setWheelOpen(false)} />}
     </div>
   );
 }
@@ -668,6 +767,7 @@ const TAGLINES = {
   bucket: "Où rêves-tu d'aller ?",
   trips: "Prochain embarquement…",
   journal: "Souvenirs d'ailleurs",
+  world: "Ton monde, pays après pays",
 };
 
 function MainHero({ tab, bucket, trips, journal, onLogout, onOpenTrip }) {
@@ -686,6 +786,7 @@ function MainHero({ tab, bucket, trips, journal, onLogout, onOpenTrip }) {
           : parseCountries(t.countries).map((c) => ({ q: c, label: c, sub: t.title, done }));
       });
     }
+    if (tab === "world") return allPlaces(bucket, trips, journal);
     return journal.filter((j) => j.place || j.country)
       .map((j) => ({ q: [j.place, j.country].filter(Boolean).join(", "), label: j.place || j.country, sub: j.place ? j.country : "", done: true }));
   }, [tab, bucket, trips, journal]);
@@ -738,14 +839,15 @@ function TabIcon({ name, color }) {
   const p = { width: 22, height: 22, viewBox: "0 0 24 24", fill: "none", stroke: color, strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round" };
   if (name === "globe") return <svg {...p}><circle cx="12" cy="12" r="9" /><ellipse cx="12" cy="12" rx="4" ry="9" /><path d="M3.5 9h17M3.5 15h17" /></svg>;
   if (name === "plane") return <PlaneIcon size={22} color={color} rotate={45} />;
+  if (name === "map") return <svg {...p}><path d="M9 4 3 6.5v13.5l6-2.5 6 2.5 6-2.5V4l-6 2.5z" /><path d="M9 4v13.5M15 6.5V20" /></svg>;
   return <svg {...p}><path d="M5 5.5A2.5 2.5 0 0 1 7.5 3H19v15H7.5A2.5 2.5 0 0 0 5 20.5z" /><path d="M5 20.5A2.5 2.5 0 0 1 7.5 18H19v3H7.5" /></svg>;
 }
 
 function TabButton({ active, onClick, icon, label }) {
   return (
-    <button onClick={onClick} className="press flex-1 flex flex-col items-center gap-1 py-2 rounded-xl" style={{ color: active ? ROSE : TEXT_MUTED, background: active ? ROSE + "14" : "transparent", transition: "background .25s" }}>
+    <button onClick={onClick} className="press flex-1 flex flex-col items-center gap-1 py-2 rounded-xl min-w-0" style={{ color: active ? ROSE : TEXT_MUTED, background: active ? ROSE + "14" : "transparent", transition: "background .25s" }}>
       <span key={String(active)} className={active ? "pop" : ""} style={{ opacity: active ? 1 : 0.75 }}><TabIcon name={icon} color={active ? ROSE : TEXT_MUTED} /></span>
-      <span className="text-[10px] tracking-wide text-center leading-none font-medium">{label}</span>
+      <span className="text-[10px] tracking-wide text-center leading-none font-medium whitespace-nowrap">{label}</span>
     </button>
   );
 }
@@ -773,21 +875,95 @@ function SectionHeader({ label, action, onAction, outline }) {
   return (
     <div className="flex items-center justify-between mb-4">
       <p className="text-[11px] uppercase tracking-[0.15em]" style={{ color: ROSE }}>{label}</p>
-      <button onClick={onAction} className="press flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full font-medium"
-        style={outline ? { border: `1px solid ${BORDER}`, color: TEXT } : { backgroundColor: ROSE, color: "#FFFFFF", boxShadow: "0 6px 14px -8px rgba(200,86,120,0.9)" }}>
-        {action}
-      </button>
+      {action && (
+        <button onClick={onAction} className="press flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full font-medium"
+          style={outline ? { border: `1px solid ${BORDER}`, color: TEXT } : { backgroundColor: ROSE, color: "#FFFFFF", boxShadow: "0 6px 14px -8px rgba(200,86,120,0.9)" }}>
+          {action}
+        </button>
+      )}
     </div>
+  );
+}
+function ProgressBar({ pct, color = ROSE, plane = false, height = 8 }) {
+  const p = Math.max(0, Math.min(100, pct));
+  return (
+    <div className="relative rounded-full" style={{ height, background: SURFACE_ALT, border: `1px solid ${BORDER}` }}>
+      <div className="absolute left-0 top-0 bottom-0 rounded-full" style={{ width: `${p}%`, background: color, transition: "width .8s cubic-bezier(.2,.8,.2,1)" }} />
+      {plane && (
+        <div className="absolute" style={{ left: `calc(${p}% - 9px)`, top: -6, transition: "left .8s cubic-bezier(.2,.8,.2,1)" }}>
+          <PlaneIcon size={18} rotate={90} color={color} />
+        </div>
+      )}
+    </div>
+  );
+}
+function ChipSelect({ value, onChange, options }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {options.map((o) => {
+        const on = value === o.v;
+        return (
+          <button key={String(o.v)} type="button" onClick={() => onChange(on && o.toggle ? null : o.v)} className="press text-xs px-3 py-1.5 rounded-full border"
+            style={{ borderColor: on ? (o.color || ROSE) : BORDER, background: on ? (o.color || ROSE) + "1F" : BG, color: on ? (o.color || ROSE) : TEXT_MUTED }}>
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+function Segmented({ value, onChange, options }) {
+  const idx = Math.max(0, options.findIndex((o) => o.k === value));
+  const w = 100 / options.length;
+  return (
+    <div className="relative flex p-1 rounded-2xl" style={{ background: SURFACE_ALT, border: `1px solid ${BORDER}` }}>
+      <div className="absolute top-1 bottom-1 rounded-xl" style={{ left: `calc(${idx * w}% + 4px)`, width: `calc(${w}% - 8px)`, background: SURFACE, boxShadow: "0 4px 12px -6px rgba(91,46,87,0.4)", transition: "left .35s cubic-bezier(.2,.8,.2,1)" }} />
+      {options.map((o) => (
+        <button key={o.k} onClick={() => onChange(o.k)} className="relative flex-1 py-2 text-xs font-medium whitespace-nowrap" style={{ color: value === o.k ? ROSE : TEXT_MUTED, transition: "color .25s" }}>{o.label}</button>
+      ))}
+    </div>
+  );
+}
+function StarRating({ value = 0, onChange, size = 14 }) {
+  return (
+    <span className="inline-flex gap-0.5">
+      {[1, 2, 3, 4, 5].map((n) => (
+        <span key={n} onClick={onChange ? (e) => { e.stopPropagation(); onChange(n === value ? null : n); } : undefined}
+          className={onChange ? "press cursor-pointer" : ""} style={{ fontSize: size, color: n <= (value || 0) ? GOLD : BORDER, lineHeight: 1 }}>★</span>
+      ))}
+    </span>
   );
 }
 
 /* ---------- Bucket list ---------- */
 
-function BucketList({ items, onAdd, onEdit, onDelete, onToggle }) {
-  const todo = items.filter((i) => i.status !== "visite");
+const PRIORITIES = [
+  { v: 1, label: "Un jour" },
+  { v: 2, label: "Bientôt" },
+  { v: 3, label: "Absolument ♥", color: DANGER },
+];
+
+function BucketList({ items, onAdd, onEdit, onDelete, onToggle, onWheel }) {
+  const todo = items.filter((i) => i.status !== "visite").sort((a, b) => (b.priority || 0) - (a.priority || 0));
   const done = items.filter((i) => i.status === "visite");
   return (
     <div>
+      {todo.length >= 2 && (
+        <button onClick={onWheel} className="press fade-up w-full mb-5 rounded-2xl p-4 flex items-center gap-4 text-left text-white relative overflow-hidden"
+          style={{ background: "linear-gradient(120deg, #4A2950, #B9577A 60%, #E6948F)", boxShadow: "0 12px 24px -16px rgba(91,46,87,0.9)" }}>
+          <svg width="52" height="52" viewBox="-26 -26 52 52" className="spin-slow shrink-0">
+            {PALETTE.slice(0, 8).map((c, i) => {
+              const a0 = (i * Math.PI) / 4, a1 = ((i + 1) * Math.PI) / 4;
+              return <path key={i} d={`M0 0 L${24 * Math.sin(a0)} ${-24 * Math.cos(a0)} A24 24 0 0 1 ${24 * Math.sin(a1)} ${-24 * Math.cos(a1)} Z`} fill={c} stroke="#FFFFFF" strokeWidth="1" />;
+            })}
+            <circle r="5" fill="#FFFFFF" />
+          </svg>
+          <div className="min-w-0">
+            <p style={{ fontFamily: SERIF }} className="text-lg leading-tight">La roue des destinations</p>
+            <p className="text-xs opacity-85 mt-0.5">Pas d'idée pour le prochain voyage ? Laisse le hasard choisir ✨</p>
+          </div>
+        </button>
+      )}
       <SectionHeader label={`${todo.length} à visiter · ${done.length} visité${done.length > 1 ? "s" : ""}`} action="+ Ajouter" onAction={onAdd} />
       {items.length === 0 ? <EmptyState text="Note les pays ou endroits que tu rêves de visiter un jour : ils apparaîtront sur le globe." /> : (
         <div className="space-y-2">
@@ -800,8 +976,17 @@ function BucketList({ items, onAdd, onEdit, onDelete, onToggle }) {
                   {visited ? <span key="v" className="pop text-white text-sm">✓</span> : <PlaneIcon size={14} color={ROSE_PALE} rotate={45} />}
                 </button>
                 <button onClick={() => onEdit(i)} className="flex-1 min-w-0 text-left">
-                  {i.country && <Pill color={colorFor(i.country)}>{i.country}</Pill>}
+                  <div className="flex items-center gap-2">
+                    {i.country && <Pill color={colorFor(i.country)}>{i.country}</Pill>}
+                    {!visited && i.priority > 1 && <span className="text-[11px]" style={{ color: DANGER }}>{"♥".repeat(i.priority - 1)}</span>}
+                  </div>
                   <p className="text-sm mt-1" style={{ textDecoration: visited ? "line-through" : "none", color: visited ? TEXT_MUTED : TEXT }}>{i.place}</p>
+                  {(i.budget_estimate || i.best_period) && (
+                    <p className="text-[11px] mt-0.5 flex gap-3" style={{ color: TEXT_MUTED }}>
+                      {i.budget_estimate ? <span style={{ fontFamily: MONO }}>≈ {eur(i.budget_estimate)}</span> : null}
+                      {i.best_period ? <span>🗓 {i.best_period}</span> : null}
+                    </p>
+                  )}
                   {i.note && <p className="text-[11px] mt-0.5 truncate" style={{ color: TEXT_MUTED }}>{i.note}</p>}
                 </button>
                 {visited && (
@@ -822,14 +1007,94 @@ function BucketForm({ initial, onClose, onSubmit }) {
   const [place, setPlace] = useState(initial?.place || "");
   const [country, setCountry] = useState(initial?.country || "");
   const [note, setNote] = useState(initial?.note || "");
+  const [priority, setPriority] = useState(initial?.priority || 2);
+  const [budget, setBudget] = useState(initial?.budget_estimate ?? "");
+  const [period, setPeriod] = useState(initial?.best_period || "");
   return (
     <Sheet title={initial ? "Modifier" : "Ajouter à la bucket list"} onClose={onClose}>
       <Field label="Endroit"><input className={inputClass} style={inputStyle} value={place} onChange={(e) => setPlace(e.target.value)} placeholder="Ex : Kyoto, Patagonie, Cap Nord…" /></Field>
       <Field label="Pays (optionnel)"><input className={inputClass} style={inputStyle} value={country} onChange={(e) => setCountry(e.target.value)} placeholder="Ex : Japon" /></Field>
-      <Field label="Note (optionnel)"><textarea className={inputClass} style={{ ...inputStyle, minHeight: 70 }} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Pourquoi cet endroit, quand idéalement…" /></Field>
-      <PrimaryButton disabled={!place} onClick={() => onSubmit({ id: initial?.id, place, country, note, status: initial?.status || "a_visiter" })}>
+      <Field label="Envie"><ChipSelect value={priority} onChange={setPriority} options={PRIORITIES} /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Budget estimé (€)"><input type="number" inputMode="decimal" min="0" className={inputClass} style={inputStyle} value={budget} onChange={(e) => setBudget(e.target.value)} placeholder="Ex : 1500" /></Field>
+        <Field label="Meilleure période"><input className={inputClass} style={inputStyle} value={period} onChange={(e) => setPeriod(e.target.value)} placeholder="Ex : avril–mai" /></Field>
+      </div>
+      <Field label="Note (optionnel)"><textarea className={inputClass} style={{ ...inputStyle, minHeight: 70 }} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Pourquoi cet endroit, ce que tu veux y faire…" /></Field>
+      <PrimaryButton disabled={!place} onClick={() => onSubmit({
+        id: initial?.id, place, country, note, status: initial?.status || "a_visiter",
+        priority, budget_estimate: budget === "" ? null : Number(budget), best_period: period || null,
+      })}>
         {initial ? "Enregistrer" : "Ajouter"}
       </PrimaryButton>
+    </Sheet>
+  );
+}
+
+/* ---------- Roue des destinations ---------- */
+
+function DestinationWheel({ items, onClose }) {
+  const pool = useMemo(() => {
+    const todo = items.filter((i) => i.status !== "visite");
+    const src = (todo.length >= 2 ? todo : items).map((i) => ({ label: i.place, sub: i.country }));
+    return shuffle(src.length >= 2 ? src : DEMO.map((d) => ({ label: d.label, sub: d.sub }))).slice(0, 12);
+  }, []);
+  const n = pool.length, seg = 360 / n, R = 130, C = 140;
+  const [angle, setAngle] = useState(0);
+  const [spinning, setSpinning] = useState(false);
+  const [result, setResult] = useState(null);
+  const confetti = useMemo(() => Array.from({ length: 22 }, (_, i) => ({
+    x: Math.cos((i / 22) * Math.PI * 2) * (60 + Math.random() * 70), y: Math.sin((i / 22) * Math.PI * 2) * (40 + Math.random() * 60) - 30,
+    r: Math.random() * 720 - 360, c: PALETTE[i % PALETTE.length], d: Math.random() * 120,
+  })), [result]);
+
+  const spin = () => {
+    if (spinning) return;
+    setResult(null);
+    const idx = Math.floor(Math.random() * n);
+    const jitter = (Math.random() - 0.5) * seg * 0.6;
+    const target = angle - (angle % 360) + 360 * 6 + (360 - (idx + 0.5) * seg) + jitter;
+    setAngle(target);
+    setSpinning(true);
+    setTimeout(() => { setSpinning(false); setResult(pool[idx]); }, 4700);
+  };
+  const pt = (a, r) => [C + r * Math.sin((a * Math.PI) / 180), C - r * Math.cos((a * Math.PI) / 180)];
+
+  return (
+    <Sheet title="La roue des destinations" onClose={onClose}>
+      <div className="relative mx-auto" style={{ width: 280, height: 296 }}>
+        <div className="absolute z-10" style={{ left: 129, top: -2 }}><PlaneIcon size={22} rotate={180} color={TEXT} /></div>
+        <svg width="280" height="280" viewBox="0 0 280 280" style={{ marginTop: 14, transform: `rotate(${angle}deg)`, transition: spinning ? "transform 4.6s cubic-bezier(.17,.67,.12,1)" : "none" }}>
+          {pool.map((p, i) => {
+            const a0 = i * seg, a1 = (i + 1) * seg, [x0, y0] = pt(a0, R), [x1, y1] = pt(a1, R);
+            const label = p.label.length > 13 ? p.label.slice(0, 12) + "…" : p.label;
+            return (
+              <g key={i}>
+                <path d={`M${C} ${C} L${x0} ${y0} A${R} ${R} 0 ${seg > 180 ? 1 : 0} 1 ${x1} ${y1} Z`} fill={PALETTE[i % PALETTE.length]} stroke="#FFFFFF" strokeWidth="2" />
+                <g transform={`rotate(${a0 + seg / 2 - 90} ${C} ${C})`}>
+                  <text x={C + R - 12} y={C} textAnchor="end" dominantBaseline="middle" fill="#FFFFFF" fontSize="11" fontWeight="600" fontFamily="IBM Plex Sans, sans-serif">{label}</text>
+                </g>
+              </g>
+            );
+          })}
+          <circle cx={C} cy={C} r="18" fill="#FFFFFF" stroke={BORDER} strokeWidth="2" />
+          <circle cx={C} cy={C} r="6" fill={ROSE} />
+        </svg>
+      </div>
+      <div className="relative text-center mt-2" style={{ minHeight: 72 }}>
+        {result ? (
+          <div key={result.label} className="fade-up">
+            {confetti.map((c, i) => (
+              <span key={i} className="absolute" style={{ left: "50%", top: 20, width: 7, height: 10, borderRadius: 2, background: c.c, "--x": `${c.x}px`, "--y": `${c.y}px`, "--r": `${c.r}deg`, animation: `confetti 1.1s ease-out ${c.d}ms both` }} />
+            ))}
+            <p className="text-[11px] uppercase tracking-[0.25em]" style={{ color: ROSE }}>Cap sur</p>
+            <p style={{ fontFamily: SERIF }} className="text-3xl mt-1">{result.label}</p>
+            {result.sub && <p className="text-xs mt-0.5" style={{ color: TEXT_MUTED }}>{result.sub}</p>}
+          </div>
+        ) : (
+          <p className="text-sm pt-4" style={{ color: TEXT_MUTED }}>{spinning ? "Les moteurs chauffent…" : `${n} destinations dans la roue`}</p>
+        )}
+      </div>
+      <PrimaryButton disabled={spinning} onClick={spin} className="mt-4">{result ? "Relancer la roue" : "Tourner la roue"}</PrimaryButton>
     </Sheet>
   );
 }
@@ -899,6 +1164,7 @@ function TripForm({ initial, onClose, onSubmit }) {
   const [startDate, setStartDate] = useState(initial?.start_date || "");
   const [endDate, setEndDate] = useState(initial?.end_date || "");
   const [countries, setCountries] = useState(initial?.countries || "");
+  const [budget, setBudget] = useState(initial?.budget ?? "");
   const [notes, setNotes] = useState(initial?.notes || "");
   return (
     <Sheet title={initial ? "Modifier le road trip" : "Nouveau road trip"} onClose={onClose}>
@@ -908,17 +1174,26 @@ function TripForm({ initial, onClose, onSubmit }) {
         <Field label="Date de retour"><input type="date" className={inputClass} style={inputStyle} value={endDate} onChange={(e) => setEndDate(e.target.value)} /></Field>
       </div>
       <Field label="Pays traversés (séparés par des virgules)"><input className={inputClass} style={inputStyle} value={countries} onChange={(e) => setCountries(e.target.value)} placeholder="Ex : Croatie, Monténégro, Albanie" /></Field>
-      <Field label="Notes (optionnel)"><textarea className={inputClass} style={{ ...inputStyle, minHeight: 70 }} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Idées, budget approximatif, contraintes…" /></Field>
-      <PrimaryButton disabled={!title} onClick={() => onSubmit({ id: initial?.id, title, start_date: startDate || null, end_date: endDate || null, countries, notes })}>
+      <Field label="Budget total (€, optionnel)"><input type="number" inputMode="decimal" min="0" className={inputClass} style={inputStyle} value={budget} onChange={(e) => setBudget(e.target.value)} placeholder="Ex : 2000" /></Field>
+      <Field label="Notes (optionnel)"><textarea className={inputClass} style={{ ...inputStyle, minHeight: 70 }} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Idées, contraintes…" /></Field>
+      <PrimaryButton disabled={!title} onClick={() => onSubmit({ id: initial?.id, title, start_date: startDate || null, end_date: endDate || null, countries, notes, budget: budget === "" ? null : Number(budget) })}>
         {initial ? "Enregistrer les modifications" : "Créer le road trip"}
       </PrimaryButton>
     </Sheet>
   );
 }
 
-function TripDetail({ trip, journal, onBack, onSaveStops, onEditTrip, onDeleteTrip, onAddJournal, children }) {
+const TRIP_TABS = [
+  { k: "route", label: "Itinéraire" },
+  { k: "check", label: "Checklist" },
+  { k: "budget", label: "Budget" },
+  { k: "notes", label: "Carnet" },
+];
+
+function TripDetail({ trip, journal, errorBanner, onBack, onPatch, onEditTrip, onDeleteTrip, onAddJournal, children }) {
   const [stopEditor, setStopEditor] = useState(null);
   const [leg, setLeg] = useState(null);
+  const [section, setSection] = useState("route");
   const stops = trip.stops || [];
   const st = tripStatus(trip);
   const countries = parseCountries(trip.countries);
@@ -927,15 +1202,16 @@ function TripDetail({ trip, journal, onBack, onSaveStops, onEditTrip, onDeleteTr
     ? stops.map((s) => ({ q: s.name, label: s.name, sub: "" }))
     : countries.map((c) => ({ q: c, label: c, sub: "" }));
   const points = useGeoPoints(items);
+  const km = tripKm(trip);
 
   const saveStop = (stop) => {
     let next;
     if (stop.id) next = stops.map((s) => (s.id === stop.id ? stop : s));
     else next = [...stops, { ...stop, id: uid() }];
-    onSaveStops(next);
+    onPatch({ stops: next });
     setStopEditor(null);
   };
-  const deleteStop = (id) => onSaveStops(stops.filter((s) => s.id !== id));
+  const deleteStop = (id) => onPatch({ stops: stops.filter((s) => s.id !== id) });
 
   const glass = { background: "rgba(255,255,255,0.14)", border: "1px solid rgba(255,255,255,0.25)" };
 
@@ -953,9 +1229,10 @@ function TripDetail({ trip, journal, onBack, onSaveStops, onEditTrip, onDeleteTr
           <div className="flex items-end justify-between gap-3 mt-4 fade-up">
             <div className="min-w-0">
               <h1 style={{ fontFamily: SERIF }} className="text-3xl leading-tight">{trip.title}</h1>
-              <div className="flex items-center gap-2 mt-2 text-xs opacity-90">
+              <div className="flex flex-wrap items-center gap-2 mt-2 text-xs opacity-90">
                 <span className="px-2 py-0.5 rounded-full" style={glass}>{st.label}</span>
                 {(trip.start_date || trip.end_date) && <span>{formatShort(trip.start_date)} → {formatShort(trip.end_date)}</span>}
+                {km > 0 && <span style={{ fontFamily: MONO }}>≈ {fmtNum(km)} km</span>}
               </div>
             </div>
             <div className="text-center shrink-0 px-3 py-2 rounded-2xl" style={{ background: "rgba(255,214,140,0.2)", border: "1px solid rgba(255,214,140,0.6)" }}>
@@ -974,43 +1251,61 @@ function TripDetail({ trip, journal, onBack, onSaveStops, onEditTrip, onDeleteTr
         {countries.length === 0 && <div style={{ height: 18 }} />}
       </Sky>
 
-      <main className="px-5 mt-6 space-y-7">
-        {trip.notes && <Card className="fade-up"><p className="text-xs leading-relaxed" style={{ color: TEXT_MUTED }}>{trip.notes}</p></Card>}
+      {errorBanner}
 
-        <div>
-          <SectionHeader label="Itinéraire" action="+ Étape" onAction={() => setStopEditor(true)} />
-          {stops.length === 0 ? <EmptyState text="Ajoute les étapes de ton itinéraire, dans l'ordre : l'avion les reliera sur le globe." /> : (
-            <div className="relative">
-              <div className="absolute" style={{ left: 15, top: 16, bottom: 16, borderLeft: `2px dashed ${ROSE_PALE}` }} />
-              {stops.map((s, idx) => {
-                const edge = idx === 0 || idx === stops.length - 1;
-                return (
-                  <div key={s.id} className="fade-up relative flex items-start gap-3 mb-2" style={{ animationDelay: `${Math.min(idx, 10) * 60}ms` }}>
-                    <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-semibold shrink-0 mt-1.5 relative"
-                      style={{ background: edge ? ROSE : SURFACE, color: edge ? "#FFFFFF" : ROSE, border: `2px solid ${ROSE}`, fontFamily: MONO }}>
-                      {idx === stops.length - 1 && stops.length > 1 ? "🏁" : idx + 1}
-                    </div>
-                    <Card className="flex-1 min-w-0 flex items-start gap-2 !p-3">
-                      <button onClick={() => setStopEditor(s)} className="flex-1 min-w-0 text-left">
-                        <p className="text-sm font-medium">{s.name}</p>
-                        {(s.arrival || s.departure) && <p className="text-[11px] mt-0.5" style={{ color: TEXT_MUTED, fontFamily: MONO }}>{formatShort(s.arrival)}{s.departure ? ` → ${formatShort(s.departure)}` : ""}</p>}
-                        {s.notes && <p className="text-[11px] mt-1" style={{ color: TEXT_MUTED }}>{s.notes}</p>}
-                      </button>
-                      <button onClick={() => deleteStop(s.id)} style={{ color: TEXT_MUTED, fontSize: 13 }} className="press shrink-0">🗑️</button>
-                    </Card>
-                  </div>
-                );
-              })}
+      <div className="px-5 mt-5 sticky z-30" style={{ top: "calc(8px + env(safe-area-inset-top))" }}>
+        <Segmented value={section} onChange={setSection} options={TRIP_TABS} />
+      </div>
+
+      <main key={section} className="px-5 mt-5 space-y-6">
+        {section === "route" && (
+          <>
+            {trip.notes && <Card className="fade-up"><p className="text-xs leading-relaxed" style={{ color: TEXT_MUTED }}>{trip.notes}</p></Card>}
+            <div>
+              <SectionHeader label={km > 0 ? `${stops.length} étapes · ≈ ${fmtNum(km)} km` : "Étapes"} action="+ Étape" onAction={() => setStopEditor(true)} />
+              {stops.length === 0 ? <EmptyState text="Ajoute les étapes de ton itinéraire, dans l'ordre : l'avion les reliera sur le globe." /> : (
+                <div className="relative">
+                  <div className="absolute" style={{ left: 15, top: 16, bottom: 16, borderLeft: `2px dashed ${ROSE_PALE}` }} />
+                  {stops.map((s, idx) => {
+                    const edge = idx === 0 || idx === stops.length - 1;
+                    const a = idx > 0 && geoOf(stops[idx - 1].name), b = geoOf(s.name);
+                    const legKm = a && b ? distKm(a, b) : null;
+                    return (
+                      <div key={s.id} className="fade-up relative flex items-start gap-3 mb-2" style={{ animationDelay: `${Math.min(idx, 10) * 60}ms` }}>
+                        <div className="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-semibold shrink-0 mt-1.5 relative"
+                          style={{ background: edge ? ROSE : SURFACE, color: edge ? "#FFFFFF" : ROSE, border: `2px solid ${ROSE}`, fontFamily: MONO }}>
+                          {idx === stops.length - 1 && stops.length > 1 ? "🏁" : idx + 1}
+                        </div>
+                        <Card className="flex-1 min-w-0 flex items-start gap-2 !p-3">
+                          <button onClick={() => setStopEditor(s)} className="flex-1 min-w-0 text-left">
+                            <div className="flex items-baseline justify-between gap-2">
+                              <p className="text-sm font-medium truncate">{s.name}</p>
+                              {legKm !== null && <span className="text-[10px] shrink-0 px-1.5 py-0.5 rounded-full" style={{ fontFamily: MONO, background: SURFACE_ALT, color: ROSE }}>+{fmtNum(legKm)} km</span>}
+                            </div>
+                            {(s.arrival || s.departure) && <p className="text-[11px] mt-0.5" style={{ color: TEXT_MUTED, fontFamily: MONO }}>{formatShort(s.arrival)}{s.departure ? ` → ${formatShort(s.departure)}` : ""}</p>}
+                            {s.notes && <p className="text-[11px] mt-1" style={{ color: TEXT_MUTED }}>{s.notes}</p>}
+                          </button>
+                          <button onClick={() => deleteStop(s.id)} style={{ color: TEXT_MUTED, fontSize: 13 }} className="press shrink-0">🗑️</button>
+                        </Card>
+                      </div>
+                    );
+                  })}
+                  {km > 0 && <p className="text-[10px] mt-2 pl-11" style={{ color: TEXT_MUTED }}>Distances à vol d'oiseau entre les étapes.</p>}
+                </div>
+              )}
             </div>
-          )}
-        </div>
-
-        <div>
-          <SectionHeader label="Carnet de ce voyage" action="+ Note" onAction={onAddJournal} outline />
-          {journal.length === 0 ? <EmptyState text="Aucune note de voyage liée pour l'instant." /> : (
-            <div className="space-y-3">{journal.map((j, idx) => <JournalCard key={j.id} entry={j} delay={idx * 50} />)}</div>
-          )}
-        </div>
+          </>
+        )}
+        {section === "check" && <Checklist trip={trip} onPatch={onPatch} />}
+        {section === "budget" && <TripBudget trip={trip} countries={countries} onPatch={onPatch} onEditTrip={onEditTrip} />}
+        {section === "notes" && (
+          <div>
+            <SectionHeader label="Carnet de ce voyage" action="+ Note" onAction={onAddJournal} />
+            {journal.length === 0 ? <EmptyState text="Aucune note de voyage liée pour l'instant." /> : (
+              <div className="space-y-3">{journal.map((j, idx) => <JournalCard key={j.id} entry={j} delay={idx * 50} />)}</div>
+            )}
+          </div>
+        )}
       </main>
 
       {stopEditor && <StopForm initial={typeof stopEditor === "object" ? stopEditor : null} onClose={() => setStopEditor(null)} onSubmit={saveStop} />}
@@ -1026,7 +1321,7 @@ function StopForm({ initial, onClose, onSubmit }) {
   const [notes, setNotes] = useState(initial?.notes || "");
   return (
     <Sheet title={initial ? "Modifier l'étape" : "Nouvelle étape"} onClose={onClose}>
-      <Field label="Lieu"><input className={inputClass} style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="Ex : Dubrovnik" /></Field>
+      <Field label="Lieu"><input className={inputClass} style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="Ex : Dubrovnik (ou Kotor, Monténégro)" /></Field>
       <div className="grid grid-cols-2 gap-3">
         <Field label="Arrivée"><input type="date" className={inputClass} style={inputStyle} value={arrival} onChange={(e) => setArrival(e.target.value)} /></Field>
         <Field label="Départ"><input type="date" className={inputClass} style={inputStyle} value={departure} onChange={(e) => setDeparture(e.target.value)} /></Field>
@@ -1034,6 +1329,175 @@ function StopForm({ initial, onClose, onSubmit }) {
       <Field label="Notes (optionnel)"><textarea className={inputClass} style={{ ...inputStyle, minHeight: 70 }} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Logement, à voir sur place, transport…" /></Field>
       <PrimaryButton disabled={!name} onClick={() => onSubmit({ id: initial?.id, name, arrival: arrival || null, departure: departure || null, notes })}>
         {initial ? "Enregistrer" : "Ajouter l'étape"}
+      </PrimaryButton>
+    </Sheet>
+  );
+}
+
+/* ---------- Checklist avant départ ---------- */
+
+const DEFAULT_CHECKLIST = [
+  "Passeport / carte d'identité", "Visa (si nécessaire)", "Assurance voyage", "Permis de conduire international",
+  "Adaptateur de prise", "Carte bancaire (prévenir la banque)", "Médicaments & trousse de secours", "eSIM / forfait à l'étranger",
+];
+
+function Checklist({ trip, onPatch }) {
+  const items = trip.checklist && trip.checklist.length ? trip.checklist : DEFAULT_CHECKLIST.map((label, i) => ({ id: "d" + i, label, done: false }));
+  const [newItem, setNewItem] = useState("");
+  const save = (next) => onPatch({ checklist: next });
+  const toggle = (id) => save(items.map((i) => (i.id === id ? { ...i, done: !i.done } : i)));
+  const remove = (id) => save(items.filter((i) => i.id !== id));
+  const add = () => { if (!newItem.trim()) return; save([...items, { id: uid(), label: newItem.trim(), done: false }]); setNewItem(""); };
+  const done = items.filter((i) => i.done).length;
+  const pct = items.length ? (done / items.length) * 100 : 0;
+  const ready = items.length > 0 && done === items.length;
+
+  return (
+    <div>
+      <Card className="fade-up mb-4">
+        <div className="flex items-baseline justify-between mb-3">
+          <p style={{ fontFamily: SERIF }} className="text-lg">{ready ? "Prêt pour le décollage !" : "Avant le départ"}</p>
+          <span className="text-xs" style={{ fontFamily: MONO, color: ready ? SAGE : ROSE }}>{done}/{items.length}</span>
+        </div>
+        <ProgressBar pct={pct} plane color={ready ? SAGE : ROSE} />
+        {ready && <p key="ok" className="pop text-xs mt-3" style={{ color: SAGE }}>Tout est coché, bon voyage ✈</p>}
+      </Card>
+      <div className="space-y-2">
+        {items.map((i, idx) => (
+          <div key={i.id} className="fade-up flex items-center gap-3 rounded-xl border px-3 py-2.5" style={{ animationDelay: `${Math.min(idx, 10) * 35}ms`, background: SURFACE, borderColor: BORDER }}>
+            <button onClick={() => toggle(i.id)} className="press w-6 h-6 rounded-md flex items-center justify-center shrink-0 border"
+              style={{ background: i.done ? SAGE : "transparent", borderColor: i.done ? SAGE : BORDER, transition: "background .2s" }}>
+              {i.done && <span key="c" className="pop text-white text-xs">✓</span>}
+            </button>
+            <button onClick={() => toggle(i.id)} className="flex-1 text-left text-sm" style={{ color: i.done ? TEXT_MUTED : TEXT, textDecoration: i.done ? "line-through" : "none" }}>{i.label}</button>
+            <button onClick={() => remove(i.id)} className="press text-xs shrink-0" style={{ color: TEXT_MUTED }}>✕</button>
+          </div>
+        ))}
+      </div>
+      <div className="flex gap-2 mt-3">
+        <input className={inputClass} style={inputStyle} value={newItem} onChange={(e) => setNewItem(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} placeholder="Ajouter un élément…" />
+        <button onClick={add} disabled={!newItem.trim()} className="press px-4 rounded-lg text-sm font-medium disabled:opacity-40" style={{ background: ROSE, color: "#FFFFFF" }}>+</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Budget du voyage ---------- */
+
+const EXPENSE_CATS = [
+  { v: "carburant", label: "⛽ Carburant", color: GOLD },
+  { v: "hebergement", label: "🛏️ Hébergement", color: BLUE },
+  { v: "nourriture", label: "🍜 Nourriture", color: "#CE7A52" },
+  { v: "activites", label: "🎟️ Activités", color: "#9868A8" },
+  { v: "transport", label: "🚆 Transport", color: "#3F8F8F" },
+  { v: "imprevus", label: "⚡ Imprévus", color: DANGER },
+];
+const catOf = (v) => EXPENSE_CATS.find((c) => c.v === v) || EXPENSE_CATS[EXPENSE_CATS.length - 1];
+
+function TripBudget({ trip, countries, onPatch, onEditTrip }) {
+  const [editor, setEditor] = useState(null);
+  const expenses = trip.expenses || [];
+  const total = expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+  const budget = Number(trip.budget) || 0;
+  const over = budget > 0 && total > budget;
+  const animatedTotal = useCountUp(Math.round(total));
+  const byCat = EXPENSE_CATS.map((c) => ({ ...c, sum: expenses.filter((e) => catOf(e.category).v === c.v).reduce((s, e) => s + (Number(e.amount) || 0), 0) })).filter((c) => c.sum > 0).sort((a, b) => b.sum - a.sum);
+  const byCountry = Object.entries(expenses.reduce((m, e) => { if (e.country) m[e.country] = (m[e.country] || 0) + (Number(e.amount) || 0); return m; }, {})).sort((a, b) => b[1] - a[1]);
+
+  const save = (exp) => {
+    const next = exp.id && expenses.some((e) => e.id === exp.id) ? expenses.map((e) => (e.id === exp.id ? exp : e)) : [...expenses, { ...exp, id: uid() }];
+    onPatch({ expenses: next });
+    setEditor(null);
+  };
+  const remove = (id) => onPatch({ expenses: expenses.filter((e) => e.id !== id) });
+
+  return (
+    <div>
+      <Card className="fade-up mb-5">
+        <p className="text-[11px] uppercase tracking-[0.15em]" style={{ color: TEXT_MUTED }}>Dépensé</p>
+        <div className="flex items-baseline gap-2 mt-1">
+          <p style={{ fontFamily: MONO, color: over ? DANGER : TEXT }} className="text-3xl font-semibold">{eur(animatedTotal)}</p>
+          {budget > 0 && <p className="text-sm" style={{ color: TEXT_MUTED }}>/ {eur(budget)}</p>}
+        </div>
+        {budget > 0 ? (
+          <>
+            <div className="mt-3"><ProgressBar pct={(total / budget) * 100} color={over ? DANGER : SAGE} /></div>
+            <p className="text-xs mt-2" style={{ color: over ? DANGER : SAGE }}>{over ? `Budget dépassé de ${eur(total - budget)}` : `Il reste ${eur(budget - total)}`}</p>
+          </>
+        ) : (
+          <button onClick={onEditTrip} className="press text-xs mt-2 underline" style={{ color: ROSE }}>Définir un budget pour ce voyage</button>
+        )}
+      </Card>
+
+      {byCat.length > 0 && (
+        <div className="mb-5">
+          <SectionHeader label="Par catégorie" />
+          <Card className="space-y-3">
+            {byCat.map((c) => (
+              <div key={c.v}>
+                <div className="flex justify-between text-xs mb-1"><span>{c.label}</span><span style={{ fontFamily: MONO }}>{eur(c.sum)}</span></div>
+                <ProgressBar pct={(c.sum / total) * 100} color={c.color} height={6} />
+              </div>
+            ))}
+          </Card>
+        </div>
+      )}
+
+      {byCountry.length > 0 && (
+        <div className="mb-5">
+          <SectionHeader label="Par pays" />
+          <div className="flex flex-wrap gap-2">
+            {byCountry.map(([c, sum]) => (
+              <span key={c} className="text-xs px-3 py-1.5 rounded-full" style={{ background: colorFor(c) + "1F", color: colorFor(c) }}>{c} · <b style={{ fontFamily: MONO }}>{eur(sum)}</b></span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <SectionHeader label={`${expenses.length} dépense${expenses.length > 1 ? "s" : ""}`} action="+ Dépense" onAction={() => setEditor(true)} />
+      {expenses.length === 0 ? <EmptyState text="Note tes dépenses au fil du voyage : carburant, hébergement, repas…" /> : (
+        <div className="space-y-2">
+          {[...expenses].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((e, idx) => {
+            const c = catOf(e.category);
+            return (
+              <Card key={e.id} className="fade-up flex items-center gap-3 !p-3" style={{ animationDelay: `${Math.min(idx, 10) * 35}ms` }}>
+                <span className="w-9 h-9 rounded-full flex items-center justify-center shrink-0 text-base" style={{ background: c.color + "1F" }}>{c.label.split(" ")[0]}</span>
+                <button onClick={() => setEditor(e)} className="flex-1 min-w-0 text-left">
+                  <p className="text-sm truncate">{e.label || c.label.split(" ").slice(1).join(" ")}</p>
+                  <p className="text-[11px]" style={{ color: TEXT_MUTED }}>{[formatShort(e.date), e.country].filter(Boolean).join(" · ")}</p>
+                </button>
+                <span className="text-sm font-semibold shrink-0" style={{ fontFamily: MONO }}>{eur(e.amount)}</span>
+                <button onClick={() => remove(e.id)} className="press text-xs shrink-0" style={{ color: TEXT_MUTED }}>✕</button>
+              </Card>
+            );
+          })}
+        </div>
+      )}
+      {editor && <ExpenseForm initial={typeof editor === "object" ? editor : null} countries={countries} onClose={() => setEditor(null)} onSubmit={save} />}
+    </div>
+  );
+}
+
+function ExpenseForm({ initial, countries, onClose, onSubmit }) {
+  const [label, setLabel] = useState(initial?.label || "");
+  const [amount, setAmount] = useState(initial?.amount ?? "");
+  const [category, setCategory] = useState(initial?.category || "hebergement");
+  const [country, setCountry] = useState(initial?.country || (countries.length === 1 ? countries[0] : ""));
+  const [date, setDate] = useState(initial?.date || todayISO());
+  return (
+    <Sheet title={initial ? "Modifier la dépense" : "Nouvelle dépense"} onClose={onClose}>
+      <Field label="Montant (€)"><input type="number" inputMode="decimal" min="0" step="0.01" className={inputClass} style={{ ...inputStyle, fontFamily: MONO, fontSize: 18 }} value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0" /></Field>
+      <Field label="Catégorie"><ChipSelect value={category} onChange={setCategory} options={EXPENSE_CATS} /></Field>
+      <Field label="Description (optionnel)"><input className={inputClass} style={inputStyle} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Ex : Plein à Split, auberge à Kotor…" /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Pays">
+          <input list="expense-countries" className={inputClass} style={inputStyle} value={country} onChange={(e) => setCountry(e.target.value)} placeholder="Ex : Croatie" />
+          <datalist id="expense-countries">{countries.map((c) => <option key={c} value={c} />)}</datalist>
+        </Field>
+        <Field label="Date"><input type="date" className={inputClass} style={inputStyle} value={date} onChange={(e) => setDate(e.target.value)} /></Field>
+      </div>
+      <PrimaryButton disabled={amount === "" || Number(amount) <= 0} onClick={() => onSubmit({ id: initial?.id, label, amount: Number(amount), category, country, date: date || null })}>
+        {initial ? "Enregistrer" : "Ajouter la dépense"}
       </PrimaryButton>
     </Sheet>
   );
@@ -1053,9 +1517,41 @@ function JournalCard({ entry, delay = 0 }) {
           {entry.entry_date && <span className="text-[11px]" style={{ color: TEXT_MUTED, fontFamily: MONO }}>{formatDate(entry.entry_date)}</span>}
         </div>
         <p style={{ fontFamily: SERIF }} className="text-base pr-14">{entry.title}</p>
-        {entry.place && <p className="text-[11px] mt-0.5" style={{ color: TEXT_MUTED }}>📍 {entry.place}</p>}
+        <div className="flex items-center gap-3 mt-0.5">
+          {entry.place && <p className="text-[11px]" style={{ color: TEXT_MUTED }}>📍 {entry.place}</p>}
+          {entry.rating ? <StarRating value={entry.rating} size={12} /> : null}
+        </div>
         {open && entry.content && <p className="fade-up text-xs mt-2 leading-relaxed whitespace-pre-wrap" style={{ fontFamily: SERIF, fontStyle: "italic" }}>{entry.content}</p>}
         {!open && entry.content && <p className="text-[10px] mt-2" style={{ color: ROSE }}>Lire la suite ›</p>}
+      </div>
+    </div>
+  );
+}
+
+function MemoryOfTheDay({ entries }) {
+  const [pick, setPick] = useState(() => Math.floor(Date.now() / 86400000) % entries.length);
+  const e = entries[pick % entries.length];
+  if (!e) return null;
+  const another = () => {
+    if (entries.length < 2) return;
+    let n = pick;
+    while (n === pick) n = Math.floor(Math.random() * entries.length);
+    setPick(n);
+  };
+  return (
+    <div className="fade-up mb-6 rounded-2xl p-4 text-white relative overflow-hidden" style={{ background: "linear-gradient(135deg, #4A2950, #8E3F68 55%, #D9798A)", boxShadow: "0 14px 28px -18px rgba(74,41,80,0.9)" }}>
+      <Stars count={14} maxY={90} />
+      <div className="relative">
+        <div className="flex items-center justify-between">
+          <p className="text-[10px] uppercase tracking-[0.3em] opacity-80">Souvenir du jour</p>
+          {entries.length > 1 && <button onClick={another} className="press text-[11px] px-2.5 py-1 rounded-full" style={{ background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.3)" }}>Un autre ↻</button>}
+        </div>
+        <div key={e.id} className="caption-in">
+          <p style={{ fontFamily: SERIF }} className="text-xl mt-2 leading-snug">{e.title}</p>
+          <p className="text-xs mt-1 opacity-85">{[e.place, e.country].filter(Boolean).join(", ")}{e.entry_date ? ` · ${relTime(e.entry_date)}` : ""}</p>
+          {e.rating ? <div className="mt-1"><StarRating value={e.rating} size={13} /></div> : null}
+          {e.content && <p className="text-xs mt-2 italic opacity-90 leading-relaxed" style={{ fontFamily: SERIF, display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden" }}>« {e.content} »</p>}
+        </div>
       </div>
     </div>
   );
@@ -1064,6 +1560,7 @@ function JournalCard({ entry, delay = 0 }) {
 function Journal({ entries, trips, onAdd, onEdit, onDelete }) {
   return (
     <div>
+      {entries.length > 0 && <MemoryOfTheDay entries={entries} />}
       <SectionHeader label={`${entries.length} note${entries.length > 1 ? "s" : ""}`} action="+ Nouvelle note" onAction={onAdd} />
       {entries.length === 0 ? <EmptyState text="Garde une trace de tes découvertes, anecdotes et impressions de voyage." /> : (
         <div className="space-y-3">
@@ -1089,6 +1586,7 @@ function JournalForm({ initial, trips, onClose, onSubmit }) {
   const [entryDate, setEntryDate] = useState(initial?.entry_date || todayISO());
   const [content, setContent] = useState(initial?.content || "");
   const [tripId, setTripId] = useState(initial?.trip_id || "");
+  const [rating, setRating] = useState(initial?.rating || null);
 
   return (
     <Sheet title={initial?.id ? "Modifier la note" : "Nouvelle note de voyage"} onClose={onClose}>
@@ -1097,7 +1595,10 @@ function JournalForm({ initial, trips, onClose, onSubmit }) {
         <Field label="Lieu"><input className={inputClass} style={inputStyle} value={place} onChange={(e) => setPlace(e.target.value)} placeholder="Ex : Marrakech" /></Field>
         <Field label="Pays"><input className={inputClass} style={inputStyle} value={country} onChange={(e) => setCountry(e.target.value)} placeholder="Ex : Maroc" /></Field>
       </div>
-      <Field label="Date"><input type="date" className={inputClass} style={inputStyle} value={entryDate} onChange={(e) => setEntryDate(e.target.value)} /></Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Date"><input type="date" className={inputClass} style={inputStyle} value={entryDate} onChange={(e) => setEntryDate(e.target.value)} /></Field>
+        <Field label="Ta note"><div className="py-2"><StarRating value={rating} onChange={setRating} size={24} /></div></Field>
+      </div>
       {trips.length > 0 && (
         <Field label="Lier à un road trip (optionnel)">
           <select className={inputClass} style={inputStyle} value={tripId} onChange={(e) => setTripId(e.target.value)}>
@@ -1107,10 +1608,173 @@ function JournalForm({ initial, trips, onClose, onSubmit }) {
         </Field>
       )}
       <Field label="Ton récit"><textarea className={inputClass} style={{ ...inputStyle, minHeight: 120 }} value={content} onChange={(e) => setContent(e.target.value)} placeholder="Ce que tu as vu, appris, ressenti sur la culture locale…" /></Field>
-      <PrimaryButton disabled={!title} onClick={() => onSubmit({ id: initial?.id, title, place, country, entry_date: entryDate || null, content, trip_id: tripId || null })}>
+      <PrimaryButton disabled={!title} onClick={() => onSubmit({ id: initial?.id, title, place, country, entry_date: entryDate || null, content, trip_id: tripId || null, rating: rating || null })}>
         {initial?.id ? "Enregistrer" : "Ajouter la note"}
       </PrimaryButton>
     </Sheet>
+  );
+}
+
+/* ---------- Mon monde : carte + statistiques ---------- */
+
+function MyWorld({ bucket, trips, journal }) {
+  const items = useMemo(() => allPlaces(bucket, trips, journal), [bucket, trips, journal]);
+  const points = useGeoPoints(items);
+  const pending = new Set(items.filter((i) => !(geoKey(i.q) in geoCache)).map((i) => geoKey(i.q))).size;
+
+  const stats = useMemo(() => {
+    const byStatus = { visite: new Map(), en_cours: new Map(), prevu: new Map(), reve: new Map() };
+    const seen = new Set();
+    // Un pays prend le statut le plus fort (les points sont déjà triés)
+    points.forEach((p) => { if (p.cc && !seen.has(p.cc)) { seen.add(p.cc); byStatus[p.status].set(p.cc, p.country || p.cc); } });
+    const visited = byStatus.visite;
+    const continents = new Set([...visited.keys()].map((cc) => CC_CONTINENT[cc]).filter(Boolean));
+    const km = trips.filter((t) => ["visite", "en_cours"].includes(tripPlaceStatus(t))).reduce((s, t) => s + tripKm(t), 0);
+    return { byStatus, visited, continents, km };
+  }, [points, trips]);
+
+  const nVisited = stats.visited.size;
+  const pct = (nVisited / WORLD_COUNTRIES) * 100;
+  const animVisited = useCountUp(nVisited);
+  const [ringOn, setRingOn] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setRingOn(true), 120); return () => clearTimeout(t); }, []);
+  const RING = 2 * Math.PI * 52;
+
+  return (
+    <div className="space-y-6">
+      {pending > 0 && <p className="text-[11px] text-center" style={{ color: TEXT_MUTED }}>Localisation de {pending} lieu{pending > 1 ? "x" : ""} en cours…</p>}
+
+      <Card className="fade-up flex items-center gap-5">
+        <div className="relative shrink-0" style={{ width: 124, height: 124 }}>
+          <svg width="124" height="124" viewBox="0 0 124 124" style={{ transform: "rotate(-90deg)" }}>
+            <circle cx="62" cy="62" r="52" fill="none" stroke={SURFACE_ALT} strokeWidth="10" />
+            <circle cx="62" cy="62" r="52" fill="none" stroke={SAGE} strokeWidth="10" strokeLinecap="round"
+              strokeDasharray={RING} strokeDashoffset={ringOn ? RING * (1 - Math.max(pct, nVisited ? 1.5 : 0) / 100) : RING} style={{ transition: "stroke-dashoffset 1.4s cubic-bezier(.2,.8,.2,1)" }} />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <span style={{ fontFamily: MONO }} className="text-3xl font-semibold leading-none">{animVisited}</span>
+            <span className="text-[10px] mt-1" style={{ color: TEXT_MUTED }}>pays visités</span>
+          </div>
+        </div>
+        <div className="min-w-0">
+          <p style={{ fontFamily: SERIF }} className="text-xl leading-tight">{pct < 0.1 ? "Le monde t'attend" : `${pct.toFixed(1).replace(".", ",")} % du monde`}</p>
+          <p className="text-xs mt-1" style={{ color: TEXT_MUTED }}>sur {WORLD_COUNTRIES} pays · encore {WORLD_COUNTRIES - nVisited} à découvrir</p>
+        </div>
+      </Card>
+
+      <div className="grid grid-cols-2 gap-3">
+        <StatTile label="Continents" value={stats.continents.size} suffix="/6" delay={60} />
+        <StatTile label="Km parcourus" value={stats.km} hint="à vol d'oiseau, road trips faits" delay={120} />
+        <StatTile label="Pays rêvés" value={stats.byStatus.reve.size + stats.byStatus.prevu.size} delay={180} />
+        <StatTile label="Notes de voyage" value={journal.length} delay={240} />
+      </div>
+
+      <div>
+        <SectionHeader label="Continents découverts" />
+        <div className="grid grid-cols-3 gap-2">
+          {Object.keys(CONTINENTS).map((c, i) => {
+            const on = stats.continents.has(c);
+            return (
+              <div key={c} className="fade-up rounded-xl border p-2.5 text-center" style={{ animationDelay: `${i * 50}ms`, background: on ? SAGE + "14" : SURFACE, borderColor: on ? SAGE : BORDER, opacity: on ? 1 : 0.6 }}>
+                <div className={on ? "pop" : ""} style={{ fontSize: 22, filter: on ? "none" : "grayscale(1)" }}>{CONTINENT_EMOJI[c]}</div>
+                <p className="text-[10px] mt-1 leading-tight" style={{ color: on ? SAGE : TEXT_MUTED }}>{c}</p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div>
+        <SectionHeader label="Ma carte du monde" />
+        <WorldMap points={points} stats={stats} />
+      </div>
+
+      {nVisited > 0 && (
+        <div>
+          <SectionHeader label="Pays visités" />
+          <div className="flex flex-wrap gap-1.5">{[...stats.visited.values()].sort().map((c) => <Pill key={c} color={SAGE}>{c}</Pill>)}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatTile({ label, value, suffix = "", hint, delay = 0 }) {
+  const v = useCountUp(value);
+  return (
+    <Card className="fade-up !p-3.5" style={{ animationDelay: `${delay}ms` }}>
+      <p className="text-[10px] uppercase tracking-[0.15em]" style={{ color: TEXT_MUTED }}>{label}</p>
+      <p className="mt-1"><span style={{ fontFamily: MONO }} className="text-2xl font-semibold">{fmtNum(v)}</span><span className="text-sm" style={{ color: TEXT_MUTED }}>{suffix}</span></p>
+      {hint && <p className="text-[9px] mt-0.5" style={{ color: TEXT_MUTED }}>{hint}</p>}
+    </Card>
+  );
+}
+
+function WorldMap({ points, stats }) {
+  const wrapRef = useRef(null);
+  const [width, setWidth] = useState(0);
+  const [world, setWorld] = useState(null);
+  const [lit, setLit] = useState(false);
+  const [sel, setSel] = useState(null);
+  useEffect(() => { let alive = true; loadWorld().then((w) => alive && setWorld(w)); return () => { alive = false; }; }, []);
+  useEffect(() => {
+    const ro = new ResizeObserver(() => wrapRef.current && setWidth(wrapRef.current.clientWidth));
+    ro.observe(wrapRef.current);
+    return () => ro.disconnect();
+  }, []);
+  useEffect(() => { const t = setTimeout(() => setLit(true), 250); return () => clearTimeout(t); }, [world]);
+
+  const height = Math.round(width * 0.5);
+  const map = useMemo(() => {
+    if (!world || !world.countries || !width) return null;
+    const proj = d3.geoEqualEarth().fitExtent([[4, 4], [width - 4, height - 4]], { type: "Sphere" });
+    const path = d3.geoPath(proj);
+    const owner = new Map();
+    points.forEach((p) => {
+      const f = world.countries.find((c) => d3.geoContains(c, [p.lon, p.lat]));
+      if (f && !owner.has(f)) owner.set(f, p);
+    });
+    let k = 0;
+    return {
+      sphere: path({ type: "Sphere" }),
+      countries: world.countries.map((f, i) => {
+        const p = owner.get(f);
+        return { key: f.id || i, d: path(f), st: p ? p.status : null, name: p ? p.country || f.properties.name : f.properties.name, order: p ? k++ : 0 };
+      }),
+      pins: points.map((p) => ({ xy: proj([p.lon, p.lat]), st: p.status, key: p.q })),
+    };
+  }, [world, width, points]);
+
+  return (
+    <Card className="fade-up !p-3">
+      <div ref={wrapRef} style={{ width: "100%" }}>
+        {map ? (
+          <svg width={width} height={height} style={{ display: "block" }}>
+            <path d={map.sphere} fill="#FFF7F8" stroke={BORDER} />
+            {map.countries.map((c) => (
+              <path key={c.key} d={c.d} onClick={() => setSel(c)}
+                fill={lit && c.st ? STATUS[c.st].color : "#EBDDE0"} stroke="#FFFFFF" strokeWidth="0.5"
+                style={{ transition: `fill .7s ease ${c.order * 90}ms`, cursor: "pointer", opacity: sel && sel.key === c.key ? 0.75 : 1 }} />
+            ))}
+            {map.pins.map((p) => p.xy && (
+              <circle key={p.key} cx={p.xy[0]} cy={p.xy[1]} r="1.8" fill="#FFFFFF" stroke={STATUS[p.st].color} strokeWidth="1" />
+            ))}
+          </svg>
+        ) : <div style={{ height: height || 160 }} className="flex items-center justify-center text-xs" ><span style={{ color: TEXT_MUTED }}>Chargement de la carte…</span></div>}
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-3 px-1">
+        {Object.entries(STATUS).map(([k, s]) => (
+          <span key={k} className="flex items-center gap-1.5 text-[11px]" style={{ color: TEXT_MUTED }}>
+            <span className="w-2.5 h-2.5 rounded-full" style={{ background: s.color }} />{s.label} <b style={{ fontFamily: MONO, color: TEXT }}>{stats.byStatus[k].size}</b>
+          </span>
+        ))}
+      </div>
+      {sel && (
+        <p key={sel.key} className="caption-in text-xs mt-2 px-1">
+          <b>{sel.name}</b> · <span style={{ color: sel.st ? STATUS[sel.st].color : TEXT_MUTED }}>{sel.st ? STATUS[sel.st].label : "Pas encore dans tes plans"}</span>
+        </p>
+      )}
+    </Card>
   );
 }
 
@@ -1130,7 +1794,7 @@ function Sheet({ title, onClose, children }) {
   return (
     <div className="backdrop fixed inset-0 flex items-end z-50" style={{ background: "rgba(34,26,54,0.45)", backdropFilter: "blur(2px)" }} onClick={onClose}>
       <div onClick={(e) => e.stopPropagation()} className="sheet w-full rounded-t-3xl p-5 pt-3 overflow-y-auto"
-        style={{ backgroundColor: SURFACE, borderTop: `1px solid ${BORDER}`, maxHeight: "88vh", paddingBottom: "calc(2rem + env(safe-area-inset-bottom))" }}>
+        style={{ backgroundColor: SURFACE, borderTop: `1px solid ${BORDER}`, maxHeight: "88vh", paddingBottom: "calc(2rem + env(safe-area-inset-bottom))", color: TEXT }}>
         <div className="mx-auto mb-4 rounded-full" style={{ width: 40, height: 4, background: BORDER }} />
         <div className="flex items-center justify-between mb-5">
           <p style={{ fontFamily: SERIF }} className="text-xl">{title}</p>
